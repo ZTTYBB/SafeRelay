@@ -40,8 +40,4 @@ jobs:
 
       - name: Activate Webhook
         run: |
-          WORKER_URL=$(npx wrangler deploy --dry-run 2>&1 | grep -oP 'https://[a-z0-9-]+\.\w+\.workers\.dev' | head -1)
-          [ -z "$WORKER_URL" ] && WORKER_URL="https://saferelay.cyx041024.workers.dev"
-          curl -s "$WORKER_URL/registerWebhook" | head -5
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          curl -s https://saferelay.cyx041024.workers.dev/registerWebhook
