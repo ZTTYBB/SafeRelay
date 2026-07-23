@@ -3550,7 +3550,13 @@ function shouldFallbackToCopy(result) {
 function isForwardedToExpectedThread(result, target) {
   if (!target?.threadId || !result?.ok) return true;
   const messages = Array.isArray(result.result) ? result.result : [result.result];
-  return messages.every(msg => msg && Number(msg.message_thread_id) === Number(target.threadId));
+  return messages.every(msg => {
+    if (!msg) return false;
+    // copyMessage/copyMessages 返回 MessageId（无 message_thread_id），无法校验线程，
+    // payload 已指定 message_thread_id，由 Telegram 保证投递到正确话题 → 视为通过
+    if (msg.message_thread_id === undefined || msg.message_thread_id === null) return true;
+    return Number(msg.message_thread_id) === Number(target.threadId);
+  });
 }
 
 async function deleteForwardedResultMessages(result, target) {
@@ -3717,6 +3723,22 @@ async function handleWebhook(event, url) {
   return new Response('Ok');
 }
 
+// 【引用片段】当回复者选中部分文字引用时，Telegram 在 message.quote 中带上
+// { text, entities, position }。将其透传到 reply_parameters，让对方也只看到被引用的片段，
+// 而非整条消息。未选中片段时 message.quote 不存在，返回空对象即可。
+function buildReplyQuoteParams(message) {
+  const quote = message && message.quote;
+  if (!quote || typeof quote.text !== 'string') return {};
+  const params = { quote: quote.text };
+  if (Array.isArray(quote.entities) && quote.entities.length) {
+    params.quote_entities = quote.entities;
+  }
+  if (typeof quote.position === 'number') {
+    params.quote_position = quote.position;
+  }
+  return params;
+}
+
 async function onUpdate(update, origin) {
   if ('callback_query' in update) {
     const callbackQuery = update.callback_query;
@@ -3736,6 +3758,8 @@ async function onUpdate(update, origin) {
     if (isAdmin(userId)) {
       return handleAdminCallback(callbackQuery);
     }
+  } else if ('message_reaction' in update) {
+    await handleMessageReaction(update.message_reaction);
   } else if ('message' in update) {
     await onMessage(update.message, origin);
   } else if ('edited_message' in update) {
@@ -6252,18 +6276,41 @@ async function handleAdminMessage(message) {
     }
 
     if (guestChatId) {
-      const copyReq = await copyMessage({
+      const copyPayload = {
         chat_id: guestChatId,
         from_chat_id: message.chat.id,
         message_id: message.message_id,
-      });
+      };
+      if (isInTopic) {
+        const guestOrigMsgId = await KV.get('fwd-orig-' + reply.message_id);
+        if (guestOrigMsgId) {
+          copyPayload.reply_parameters = {
+            message_id: parseInt(guestOrigMsgId, 10),
+            allow_sending_without_reply: true,
+            ...buildReplyQuoteParams(message)
+          };
+        }
+      }
+      const copyReq = await copyMessage(copyPayload);
 
-      // 存储管理员回复消息与访客收到消息的映射关系
       if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
         await KV.put('admin-reply-map-' + message.message_id, JSON.stringify({
           guestChatId: guestChatId,
           guestMessageId: copyReq.result.message_id
         }), { expirationTtl: 172800 });
+        await KV.put(
+          'guest-reply-map-' + guestChatId + ':' + copyReq.result.message_id,
+          message.message_id.toString(),
+          { expirationTtl: 172800 }
+        );
+        // 【表情回应】仅话题模式记录对等坐标（私聊模式不需要 react）。
+        // 管理员原消息 ↔ 用户收到的副本，供表情镜像。
+        if (isInTopic) {
+          await storeReactionPeers(
+            { chat_id: String(message.chat.id), message_id: message.message_id },
+            { chat_id: String(guestChatId), message_id: copyReq.result.message_id }
+          );
+        }
       }
 
       return copyReq;
@@ -7132,6 +7179,44 @@ async function forwardMessagesToTarget(messages, userId, target) {
   }
   if (messages.length === 1) {
     const msg = messages[0];
+
+    // 【话题模式】一律用 copyMessage 复制到话题，不显示「转发自 XX」头部（靠话题名标识用户）。
+    // 若用户引用了某条 bot 消息，再带上 reply_parameters，让管理员看到被引用的原消息。
+    // （forwardMessage 不支持 reply_parameters；话题已标识用户，复制无来源歧义）
+    if (target.label === 'topic') {
+      const copyPayload = {
+        chat_id: target.chatId,
+        from_chat_id: msg.chat.id,
+        message_id: msg.message_id
+      };
+      if (target.threadId) copyPayload.message_thread_id = target.threadId;
+
+      if (msg.reply_to_message && msg.reply_to_message.message_id) {
+        const adminOrigMsgId = await KV.get('guest-reply-map-' + userId + ':' + msg.reply_to_message.message_id);
+        if (adminOrigMsgId) {
+          copyPayload.reply_parameters = {
+            message_id: parseInt(adminOrigMsgId, 10),
+            allow_sending_without_reply: true,
+            ...buildReplyQuoteParams(msg)
+          };
+        }
+      }
+
+      const copyReq = await requestTelegram('copyMessage', copyPayload);
+      if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
+        // 注意：copyMessage 返回的是 MessageId 对象，不含 message_thread_id，
+        // 无法做线程校验。payload 已指定 message_thread_id，Telegram 保证投递到正确话题。
+        await storeForwardMapping(copyReq.result.message_id, msg, target);
+        return { ok: true, result: copyReq.result };
+      }
+      // copyMessage 失败：交给统一错误处理（话题失效会触发重建）
+      const outcome = await handleSingleForwardResult(copyReq, msg, target, userId);
+      if (outcome.success) {
+        return { ok: true, result: copyReq.result };
+      }
+      return { ok: false, errorType: outcome.errorType, raw: copyReq };
+    }
+
     const payload = {
       chat_id: target.chatId,
       from_chat_id: msg.chat.id,
@@ -7149,6 +7234,24 @@ async function forwardMessagesToTarget(messages, userId, target) {
 
   const firstMsg = messages[0];
   const messageIds = messages.map(m => m.message_id);
+
+  // 【话题模式】批量也用 copyMessages 复制到话题，不显示「转发自 XX」头部
+  if (target.label === 'topic') {
+    const copyPayload = {
+      chat_id: target.chatId,
+      from_chat_id: firstMsg.chat.id,
+      message_ids: messageIds
+    };
+    if (target.threadId) copyPayload.message_thread_id = target.threadId;
+
+    const copyReq = await requestTelegram('copyMessages', copyPayload);
+    const outcome = await handleBatchForwardResult(copyReq, messages, target, userId, messageIds.length);
+    if (outcome.success) {
+      return { ok: true, result: copyReq.result };
+    }
+    return { ok: false, errorType: outcome.errorType, raw: copyReq };
+  }
+
   const payload = {
     chat_id: target.chatId,
     from_chat_id: firstMsg.chat.id,
@@ -7244,18 +7347,87 @@ async function storeForwardMapping(forwardedMessageId, originalMessage, target =
   try {
     await KV.put('msg-map-' + forwardedMessageId, originalMessage.chat.id.toString(), { expirationTtl: 172800 });
     await KV.put('orig-map-' + originalMessage.message_id, forwardedMessageId.toString(), { expirationTtl: 172800 });
+    // 反查映射：转发消息 ID → 用户原始消息 ID，用于管理员引用回复时让用户看到被引用的原消息
+    await KV.put('fwd-orig-' + forwardedMessageId, originalMessage.message_id.toString(), { expirationTtl: 172800 });
     if (target && target.chatId) {
       await KV.put(
         'fwd-loc-' + forwardedMessageId,
         JSON.stringify({ chat_id: target.chatId, thread_id: target.threadId || null }),
         { expirationTtl: 172800 }
       );
+      // 【表情回应】仅话题模式记录对等坐标（私聊模式不需要 react）。
+      // 用户原消息 ↔ 群副本，供 react 镜像互查。
+      if (target.label === 'topic') {
+        await storeReactionPeers(
+          { chat_id: originalMessage.chat.id, message_id: originalMessage.message_id },
+          { chat_id: target.chatId, message_id: forwardedMessageId }
+        );
+      }
     }
   } catch (e) {
     Logger.warn('store_forward_mapping_failed', e, {
       forwardedMessageId,
       originalMessageId: originalMessage.message_id
     });
+  }
+}
+
+// 【表情回应】记录一对镜像消息的对等坐标（双向），供 message_reaction 镜像时互查。
+// a、b 均为 { chat_id, message_id }。任一侧被点表情，都能定位到另一侧的镜像消息。
+async function storeReactionPeers(a, b) {
+  if (!a || !b || !a.chat_id || !a.message_id || !b.chat_id || !b.message_id) return;
+  try {
+    await Promise.all([
+      KV.put(`react-peer-${a.chat_id}-${a.message_id}`, JSON.stringify(b), { expirationTtl: 172800 }),
+      KV.put(`react-peer-${b.chat_id}-${b.message_id}`, JSON.stringify(a), { expirationTtl: 172800 }),
+    ]);
+  } catch (e) {
+    Logger.warn('store_reaction_peers_failed', e, { a, b });
+  }
+}
+
+async function getReactionPeer(chatId, messageId) {
+  return await safeGetJSON(`react-peer-${chatId}-${messageId}`, null);
+}
+
+// 【表情回应】处理 message_reaction 更新，将表情镜像到对等消息。
+// 方向：
+//   - 用户私聊里对 bot 消息点表情 → 镜像到管理员/群里的副本
+//   - 群里话题内点表情 → 仅当点表情者是管理员时，镜像给用户（避免群成员表情泄露给用户）
+// Telegram 不推送 bot 自己设置的 react，因此不会形成循环。
+async function handleMessageReaction(reaction) {
+  try {
+    const chatId = reaction.chat?.id ? String(reaction.chat.id) : null;
+    const messageId = reaction.message_id;
+    if (!chatId || !messageId) return;
+
+    // 群组侧：只镜像管理员的表情，忽略其他群成员
+    if (GROUP_ID && chatId === GROUP_ID) {
+      const reactorId = reaction.user?.id ? String(reaction.user.id) : null;
+      if (!reactorId || !isAdmin(reactorId)) {
+        Logger.debug('reaction_ignored_non_admin', { chatId, reactorId });
+        return;
+      }
+    }
+
+    const peer = await getReactionPeer(chatId, messageId);
+    if (!peer || !peer.chat_id || !peer.message_id) {
+      Logger.debug('reaction_peer_not_found', { chatId, messageId });
+      return;
+    }
+
+    const newReaction = Array.isArray(reaction.new_reaction) ? reaction.new_reaction : [];
+    const result = await requestTelegram('setMessageReaction', {
+      chat_id: peer.chat_id,
+      message_id: peer.message_id,
+      reaction: newReaction
+    });
+
+    if (!result.ok) {
+      Logger.warn('mirror_reaction_failed', { chatId, messageId, peer, description: result.description });
+    }
+  } catch (e) {
+    Logger.error('handle_message_reaction_failed', e);
   }
 }
 
@@ -7283,11 +7455,8 @@ async function tryCopySingleMessage(msg, target) {
 
   const copyReq = await requestTelegram('copyMessage', payload);
   if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
-    if (!isForwardedToExpectedThread(copyReq, target)) {
-      Logger.warn('copy_single_misdirected_thread', { expectedThreadId: target.threadId, actualThreadId: copyReq.result.message_thread_id });
-      await deleteForwardedResultMessages(copyReq, target);
-      return { success: false, rawResult: { ...copyReq, errorType: 'thread_not_found' } };
-    }
+    // 注：copyMessage 返回的是 MessageId（仅含 message_id），无 message_thread_id，
+    // 无法校验线程；payload 已带 message_thread_id，由 Telegram 保证投递到正确话题。
     await storeForwardMapping(copyReq.result.message_id, msg, target);
     return { success: true };
   }
@@ -7305,11 +7474,8 @@ async function copyMessagesIndividually(messages, target) {
 
     const copyReq = await requestTelegram('copyMessage', payload);
     if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
-      if (!isForwardedToExpectedThread(copyReq, target)) {
-        Logger.warn('copy_batch_item_misdirected_thread', { expectedThreadId: target.threadId, actualThreadId: copyReq.result.message_thread_id });
-        await deleteForwardedResultMessages(copyReq, target);
-        return { success: false, rawResult: { ...copyReq, errorType: 'thread_not_found' } };
-      }
+      // copyMessage 返回 MessageId（无 message_thread_id），无法校验线程；
+      // payload 已带 message_thread_id，由 Telegram 保证投递到正确话题。
       await storeForwardMapping(copyReq.result.message_id, msg, target);
     } else {
       return { success: false, rawResult: copyReq };
@@ -7419,16 +7585,38 @@ async function handleAdminEditedMessage(message) {
     try {
       const { guestChatId, guestMessageId } = JSON.parse(replyMapData);
 
-      // 尝试编辑发送给访客的消息
-      const editReq = await requestTelegram('editMessageText', {
-        chat_id: guestChatId,
-        message_id: guestMessageId,
-        text: message.text || ''
-      });
+      // 【修复】编辑同步时携带格式信息（entities）。加粗/斜体/引用等格式都在
+      // message.entities / caption_entities 里，只传纯文本会丢失格式，且当仅改格式、
+      // 可见文本未变时 Telegram 会返回 400 "message is not modified"。
+      let editReq;
+      if (typeof message.text === 'string') {
+        editReq = await requestTelegram('editMessageText', {
+          chat_id: guestChatId,
+          message_id: guestMessageId,
+          text: message.text,
+          entities: message.entities || undefined
+        });
+      } else if (typeof message.caption === 'string') {
+        // 图片/文件等带文字说明的消息
+        editReq = await requestTelegram('editMessageCaption', {
+          chat_id: guestChatId,
+          message_id: guestMessageId,
+          caption: message.caption,
+          caption_entities: message.caption_entities || undefined
+        });
+      } else {
+        // 无文本内容（例如仅替换媒体），无法同步编辑
+        return;
+      }
 
       if (!editReq.ok) {
-        // 编辑失败，只通知管理员
         const errorCode = editReq.error_code;
+        const desc = (editReq.description || '').toLowerCase();
+
+        // 内容未变化：视为成功，不打扰管理员（常见于仅调整了不可见字符或重复编辑）
+        if (desc.includes('message is not modified')) {
+          return;
+        }
 
         // 消息已过期或被删除 (错误码 400)
         if (errorCode === 400) {
@@ -7466,7 +7654,15 @@ async function handleAdminEditedMessage(message) {
 
 async function registerWebhook(event, requestUrl, suffix, secret) {
   const webhookUrl = `${requestUrl.protocol}//${requestUrl.hostname}${suffix}`;
-  const r = await (await fetch(apiUrl('setWebhook', { url: webhookUrl, secret_token: secret }))).json();
+  // 【表情回应】默认的 allowed_updates 不含 message_reaction，必须显式声明才能收到表情事件。
+  // 一旦指定 allowed_updates 即为完整替换，因此需列全所有用到的更新类型。
+  const allowedUpdates = JSON.stringify([
+    'message',
+    'edited_message',
+    'callback_query',
+    'message_reaction'
+  ]);
+  const r = await (await fetch(apiUrl('setWebhook', { url: webhookUrl, secret_token: secret, allowed_updates: allowedUpdates }))).json();
 
   // 注册 Webhook 成功后设置命令列表
   if ('ok' in r && r.ok) {
